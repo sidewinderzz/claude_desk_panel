@@ -85,13 +85,29 @@ static bool boardInit()
     board = new Board();
     board->init();
 
-    /* Anti-drift settings for this panel under this stack. The RGB peripheral
-     * streams the frame out of PSRAM continuously; at the preset's 16 MHz the DMA
-     * can fall behind and leave every frame permanently shifted. Set after init(),
-     * before begin(). Two frame buffers back anti-tearing mode 3 in the port. */
+    /* RGB timing for this panel under this stack. Set after init(), before begin().
+     *
+     * Pixel clock: 16 MHz, the board preset's own value, and NOT lower. This was
+     * 12 MHz for a while to ease PSRAM bandwidth, and that is what put the panel
+     * into its cycling solid-colour test pattern on random boots and on most wakes.
+     * Two reasons it has to stay at 16:
+     *   - The ST7262 drops to solid colours when its DCLK is around 11 MHz or
+     *     below; 12 MHz sits on that edge.
+     *   - The LCD peripheral divides a 160 MHz source. 16 MHz is 160/(5*2), a
+     *     clean integer divider. 12 MHz is 160/(6.67*2), so the driver uses its
+     *     fractional divider and the real clock jitters between 160/7/2 = 11.4 MHz
+     *     and 160/6/2 = 13.3 MHz from period to period. Half the periods are
+     *     below the panel's floor, and whether it locks becomes a coin toss that
+     *     any disturbance (backlight toggle, DMA restart) can lose.
+     * Other clean values, if 16 ever needs to move: 20, 13.33 and 11.43 MHz.
+     *
+     * Drift (the picture shifting sideways when the DMA starves) is handled by
+     * the bounce buffer below plus CONFIG_LCD_RGB_RESTART_IN_VSYNC, which this
+     * core's precompiled IDF has ON (realigns the DMA every frame). Two frame
+     * buffers back anti-tearing mode 3 in the port. */
     auto bus = static_cast<BusRGB *>(board->getLCD()->getBus());
     bus->configRGB_BounceBufferSize(800 * 20);
-    bus->configRGB_FreqHz(12 * 1000 * 1000);
+    bus->configRGB_FreqHz(16 * 1000 * 1000);
     bus->configRGB_FrameBufferNumber(2);
 
     if (!board->begin()) {
@@ -175,6 +191,29 @@ static void displayKick(const char *why)
     lvgl_port_unlock();
 }
 
+/* One sleep path and one wake path, shared by the idle timer and the serial
+ * commands, so a wake driven from the PC exercises exactly what a tap does. */
+static void screenSleep(const char *why)
+{
+    screenOff = true;
+    screenOffAt = millis();
+    backlight(false);
+    Serial.printf("[power] screen off (%s)\n", why);
+    logHealth("slept");
+}
+
+static void screenWake(const char *why)
+{
+    screenOff = false;
+    backlight(true);
+    Serial.printf("[power] screen on (%s, off for %lus)\n", why,
+                  screenOffAt ? (millis() - screenOffAt) / 1000UL : 0UL);
+    logHealth("woke");
+    /* The RGB DMA can drift out of sync while nobody is looking at the panel.
+     * Resync on the way back up - a no-op when nothing is wrong. */
+    displayKick("wake");
+}
+
 /* Single-letter commands on the serial line, so the failure can be driven from
  * a PC in seconds instead of waiting out a 30-minute sleep timeout. */
 static void serialCommands()
@@ -184,21 +223,20 @@ static void serialCommands()
         switch (c) {
         case 'i': logHealth("cmd"); break;
         case 'r': displayKick("cmd"); break;
-        case 's':
-            screenOff = true;
-            backlight(false);
-            Serial.println("[power] screen off (cmd)");
-            break;
-        case 'w':
-            screenOff = false;
-            backlight(true);
-            Serial.println("[power] screen on (cmd)");
-            break;
+        case 's': screenSleep("cmd"); break;
+        case 'w': screenWake("cmd"); break;
         case 'b': backlight(false); Serial.println("[diag] backlight off only"); break;
         case 'B': backlight(true);  Serial.println("[diag] backlight on only"); break;
         case 'W': reqWeather = true; Serial.println("[diag] weather fetch requested"); break;
+        case 'R':
+            Serial.println("[diag] restarting");
+            Serial.flush();
+            delay(100);
+            ESP.restart();
+            break;
         case '?':
-            Serial.println("[diag] i=info r=kick s=sleep w=wake b/B=backlight only W=weather");
+            Serial.println("[diag] i=info r=kick s=sleep w=wake b/B=backlight only "
+                           "W=weather R=reboot");
             break;
         default: break;
         }
@@ -749,20 +787,9 @@ void loop()
 
         uint32_t limit = ui_sleep_ms[ui_get_sleep_index()];
         if (limit && !screenOff && idle > limit) {
-            screenOff = true;
-            screenOffAt = now;
-            backlight(false);
-            Serial.println("[power] screen off");
-            logHealth("slept");
+            screenSleep("idle");
         } else if (screenOff && idle < 2000) {
-            screenOff = false;
-            backlight(true);
-            Serial.printf("[power] screen on (off for %lus)\n",
-                          screenOffAt ? (now - screenOffAt) / 1000UL : 0UL);
-            logHealth("woke");
-            /* The RGB DMA can drift out of sync while nobody is looking at the
-             * panel. Resync on the way back up - a no-op when nothing is wrong. */
-            displayKick("wake");
+            screenWake("tap");
         }
     }
 

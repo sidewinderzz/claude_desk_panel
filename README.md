@@ -222,9 +222,23 @@ boot. Download mode: hold BOOT, tap RESET, release BOOT.
   that identifies chips by probing will bind to the expander instead of the GT911 and
   read nonsense out of it. Use the board preset, or address the GT911 at `0x5D`
   directly. A device answering 32 consecutive addresses is the tell.
-- **RGB timings are stack-specific and don't transfer.** 12 MHz pixel clock with a
-  `width*20` bounce buffer stops the panel drifting under ESP32_Display_Panel — and
-  produces a blank white screen under Arduino_GFX, which wants 16 MHz and `width*10`.
+- **Keep the pixel clock at 16 MHz.** The ST7262 falls into its cycling
+  solid-colour test pattern when its clock is around 11 MHz or below, and the
+  ESP32-S3 cannot make a clean 12 MHz: the LCD peripheral divides 160 MHz, so 12 MHz
+  goes through a fractional divider and the real clock jitters between 11.4 and
+  13.3 MHz. At 12 MHz this panel came up in colour bars on random boots and on most
+  wakes from screen-off, and a reset fixed it only sometimes. 16 MHz is 160/(5×2), an
+  integer divider, and boots and wakes have been clean since. Other clean values are
+  20, 13.33 and 11.43 MHz. Drift (sideways shift when the DMA starves) is a separate
+  problem, handled by the `width*20` bounce buffer plus the core's
+  `CONFIG_LCD_RGB_RESTART_IN_VSYNC`, which realigns the DMA every frame.
+- **RGB timings are stack-specific and don't transfer.** The bounce-buffer size that
+  is right under ESP32_Display_Panel produces a blank white screen under Arduino_GFX,
+  which wants `width*10`.
+- **Serial diagnostics** on the USB port: `i` health (heap, Wi-Fi, clock, weather),
+  `s`/`w` sleep and wake exactly as the idle timer does, `r` DMA restart, `b`/`B`
+  backlight only, `W` fetch weather, `R` reboot, `?` list. A whole reboot-and-wake
+  soak can be driven from the PC without touching the box.
 - **PSRAM must be OPI.** The 800×480 framebuffer is 768 KB; without it you get
   `no mem for frame buffer`, which reads like a wiring fault.
 - **Sliders:** LVGL draws the knob *outside* the track on all four sides. A
