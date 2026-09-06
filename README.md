@@ -59,24 +59,50 @@ Needs gcc. On Windows, WSL works: `sudo apt install build-essential`.
 
 ## Where the usage numbers come from
 
-**With a token — real numbers.** Every response from `api.anthropic.com` carries the
-account's rate-limit state in headers (`anthropic-ratelimit-unified-5h-utilization`
-and friends). A one-token Haiku request costs ~nothing and returns exactly what
-`/usage` shows. This is [Clawdmeter](https://github.com/HermannBjorgvin/Clawdmeter)'s
-approach. Mint one with `claude setup-token`, drop it in `bridge/token.txt`.
+**Use a token.** Every response from `api.anthropic.com` carries the account's
+rate-limit state in headers (`anthropic-ratelimit-unified-5h-utilization` and
+friends). A one-token Haiku request costs ~nothing and returns exactly what
+`/usage` shows — no arithmetic, no assumed budgets, the same number Anthropic
+uses to decide whether to throttle you. This is
+[Clawdmeter](https://github.com/HermannBjorgvin/Clawdmeter)'s approach. Mint one
+with `claude setup-token`, drop it in `bridge/token.txt`. Nothing else needed —
+the bridge reads it per fetch, so no restart and no reflash.
 
-**Without one — an estimate.** The bridge sums weighted token usage from
-`~/.claude/projects/**/*.jsonl` over the same windows the panel uses: a 5-hour
-session starting at the first message after a gap, and weekly windows since a fixed
-reset (default Wednesday 13:00 local). Anthropic doesn't publish the budgets, so
-calibrate once against the real panel:
+**Without one you get an estimate, and it can be wildly wrong.** The bridge sums
+weighted token usage from `~/.claude/projects/**/*.jsonl` and divides by a
+hardcoded budget. Both halves are guesses:
+
+- The numerator sees **only Claude Code on that one machine**. The web app, the
+  desktop app, another laptop — all invisible.
+- The denominator (50M session / 170M week / 60M model) is reverse-engineered.
+  Anthropic doesn't publish the real budgets.
+
+Measured on this panel the moment a token was added: the estimate said the
+5-hour session was at **9.6%** when it was really at **45%**. It also had the
+week *over*-stated (38.2% vs 30.0%) — the errors don't even share a direction,
+so there is no correction factor you can apply in your head.
+
+`--calibrate` narrows the denominator against a known-good reading, but cannot
+fix the numerator:
 
 ```bash
 python bridge/claude_usage_bridge.py --calibrate "session=1,week=20,model=30"
 ```
 
-Every gauge shows its own provenance — `api`, `api-scaled`, `calibrated`,
-`rejection` or `fallback` — so an estimate never reads as a fact.
+**Read the provenance.** Each gauge reports its own — `api`, `api-scaled`,
+`calibrated`, `rejection` or `fallback` — and the panel appends `est.` under any
+gauge that isn't live. Be aware how quiet that signal is: the big percentage
+looks identical either way, and `est.` is small muted text under it.
+
+Two things worth knowing:
+
+- **The per-model gauge is never fully live.** There is no per-model header, so
+  `api-scaled` takes the local logs' estimate of that model's *share* of the week
+  and rescales it to the real weekly total. The total is real; the share inherits
+  the one-machine blindness above.
+- **Token expiry degrades silently.** On a 401 the bridge logs
+  `token rejected — run claude setup-token` and the gauges drop back to
+  `fallback`. The panel keeps showing confident-looking numbers.
 
 ---
 
@@ -108,6 +134,15 @@ python bridge/claude_usage_bridge.py
 
 Allow it through the firewall for **private networks**, or the panel can't reach it.
 `--once` prints the payload, `--dump` shows windows and sources.
+
+Do this at the same time, or the panel shows guesses instead of your usage
+(see [Where the usage numbers come from](#where-the-usage-numbers-come-from)):
+
+```bash
+claude setup-token          # paste the result into bridge/token.txt
+```
+
+`--dump` reports `"live_status"`: `"no token"` means you are on the estimate.
 
 **2. Firmware** — copy `config.h.example` to `config.h` and set `BRIDGE_URL` to your
 PC. Wi-Fi is configured on the device itself; the `WIFI_*` defines are fallbacks.
