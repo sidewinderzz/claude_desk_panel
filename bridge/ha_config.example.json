@@ -1,0 +1,6 @@
+{
+  "url": "http://homeassistant.local:8123",
+  "token": "PASTE_A_LONG_LIVED_ACCESS_TOKEN_HERE",
+  "thermostat": "climate.living_room",
+  "lights": ["light.office", "light.office_lamp"]
+}

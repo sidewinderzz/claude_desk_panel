@@ -1,0 +1,47 @@
+{
+  "artboards": [
+    {
+      "file": "Main.dc.html",
+      "title": "Usage",
+      "x": 0,
+      "y": 0,
+      "w": 800,
+      "h": 480
+    },
+    {
+      "file": "Home.dc.html",
+      "title": "Office",
+      "x": 880,
+      "y": 0,
+      "w": 800,
+      "h": 480
+    },
+    {
+      "file": "Settings.dc.html",
+      "title": "Settings",
+      "x": 1760,
+      "y": 0,
+      "w": 800,
+      "h": 480
+    }
+  ],
+  "annotations": [
+    {
+      "id": "source-of-truth",
+      "x": 0,
+      "y": -150,
+      "w": 520,
+      "text": "Traced from ui/ui.c on the device. 800x480 fixed panel.\nHeader 66 / rule 1 / page 387 / dots 26 - the nav bar is gone, swipe moves between pages.\nCards: 18px pad, 12px radius, 1px border. Bars 14px tall, 7px radius.\nType is Montserrat 14 / 28 / 48 - the only three sizes compiled into the firmware."
+    },
+    {
+      "id": "constraints",
+      "x": 560,
+      "y": -150,
+      "w": 520,
+      "text": "Changing anything here is a mockup, not the firmware - I port edits back into ui/ui.c by hand.\nSafe to change: sizes, spacing, colour, position, copy, what goes where.\nCostly: new font sizes (each adds flash).\nAvoid: gradients, shadows, blur - the RGB panel tears on heavy redraws.\nSwipe needs LVGL gesture handling in ui.c; the dots are the only affordance left."
+    }
+  ],
+  "launch": {
+    "view": "canvas"
+  }
+}

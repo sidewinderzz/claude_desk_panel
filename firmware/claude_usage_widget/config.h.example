@@ -1,0 +1,29 @@
+#pragma once
+
+// ---------------------------------------------------------------------------
+// Fill these in before flashing.
+// ---------------------------------------------------------------------------
+
+// The ESP32-S3 has no 5 GHz radio. If this SSID is dual-band that's fine — the board
+// will simply associate on 2.4 GHz. If your 5 GHz network has a separate name, use
+// the 2.4 GHz one here.
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "PUT_YOUR_WIFI_PASSWORD_HERE"
+
+// Where claude_usage_bridge.py is listening. This was your PC's LAN address when
+// the sketch was generated; if the PC's IP changes, change it here (or give the PC
+// a DHCP reservation).
+#define BRIDGE_URL "http://YOUR-PC-IP:8787/usage"
+
+// How often to ask the bridge for fresh numbers. The bridge itself only rescans
+// the transcripts every 20s, so polling faster than that gains nothing.
+#define POLL_INTERVAL_MS 30000
+
+// Timeout for a single HTTP request.
+#define HTTP_TIMEOUT_MS 6000
+
+// How long to wait for an association before giving up, and how long to wait before
+// trying again. The connect attempt blocks, so keeping it short and the retry gap
+// long is what keeps the panel feeling responsive on a network that isn't there.
+#define WIFI_CONNECT_MS 12000
+#define WIFI_RETRY_MS 60000

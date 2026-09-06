@@ -1,0 +1,4 @@
+# Host-renderer build output. Regenerate with `make shots` / `.\run.ps1`.
+build/
+shots/
+sim
