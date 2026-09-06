@@ -25,6 +25,7 @@
 #include <ArduinoJson.h>
 
 #include <esp_display_panel.hpp>
+#include <esp_lcd_panel_rgb.h>
 #include <lvgl.h>
 
 #include "lvgl_v8_port.h"
@@ -34,7 +35,7 @@
 using namespace esp_panel::board;
 using namespace esp_panel::drivers;
 
-#define FIRMWARE_VERSION "0.6"
+#define FIRMWARE_VERSION "0.7"
 
 static Board *board = nullptr;
 static Preferences prefs;
@@ -63,6 +64,7 @@ static bool netPendingSave = false;
 static unsigned long lastPoll = 0, lastHaPoll = 0, lastTick = 0;
 static unsigned long fetchedAt = 0;
 static bool screenOff = false;
+static unsigned long screenOffAt = 0;
 static bool haveUsage = false;
 
 /* --------------------------------------------------------------- board --- */
@@ -117,6 +119,71 @@ static void backlight(bool on)
     if (on) board->getBacklight()->on();
     else    board->getBacklight()->off();
     lvgl_port_unlock();
+}
+
+/* ---------------------------------------------------------- diagnostics ---
+ *
+ * The panel can end up showing flat cycling colours while the firmware carries
+ * on running: no reset, no panic, the poll loop keeps logging. That is the
+ * signature of the RGB peripheral losing sync with its DMA rather than
+ * anything wrong with the UI, and ESP-IDF has a documented recovery for it -
+ * esp_lcd_rgb_panel_restart(), "to save the screen from a permanent shift".
+ *
+ * displayKick() tries that, then forces LVGL to repaint every pixel. If a kick
+ * brings the UI back, the fault is the RGB DMA; if it does not, the fault is
+ * below us in the panel or the CH422G, and this rules a whole class out.
+ * -------------------------------------------------------------------------- */
+
+static void logHealth(const char *why)
+{
+    Serial.printf("[diag] %s up=%lus heap=%u/%u psram=%u wifi=%d rssi=%d\n",
+                  why, millis() / 1000UL,
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
+                  (unsigned)ESP.getFreePsram(),
+                  (int)WiFi.status(), (int)WiFi.RSSI());
+}
+
+static void displayKick(const char *why)
+{
+    esp_lcd_panel_handle_t panel = nullptr;
+    if (board && board->getLCD()) panel = board->getLCD()->getHandle();
+
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (panel) err = esp_lcd_rgb_panel_restart(panel);
+    Serial.printf("[diag] displayKick(%s) restart=%s\n", why, esp_err_to_name(err));
+
+    lvgl_port_lock(-1);
+    lv_obj_invalidate(lv_scr_act());
+    lvgl_port_unlock();
+}
+
+/* Single-letter commands on the serial line, so the failure can be driven from
+ * a PC in seconds instead of waiting out a 30-minute sleep timeout. */
+static void serialCommands()
+{
+    while (Serial.available()) {
+        int c = Serial.read();
+        switch (c) {
+        case 'i': logHealth("cmd"); break;
+        case 'r': displayKick("cmd"); break;
+        case 's':
+            screenOff = true;
+            backlight(false);
+            Serial.println("[power] screen off (cmd)");
+            break;
+        case 'w':
+            screenOff = false;
+            backlight(true);
+            Serial.println("[power] screen on (cmd)");
+            break;
+        case 'b': backlight(false); Serial.println("[diag] backlight off only"); break;
+        case 'B': backlight(true);  Serial.println("[diag] backlight on only"); break;
+        case '?':
+            Serial.println("[diag] i=info r=kick s=sleep w=wake b/B=backlight only");
+            break;
+        default: break;
+        }
+    }
 }
 
 /* ------------------------------------------------------------ settings --- */
@@ -476,6 +543,7 @@ void loop()
         netBegin();
     }
 
+    serialCommands();
     netLoop();
 
     bool online = WiFi.status() == WL_CONNECTED;
@@ -555,12 +623,19 @@ void loop()
         uint32_t limit = ui_sleep_ms[ui_get_sleep_index()];
         if (limit && !screenOff && idle > limit) {
             screenOff = true;
+            screenOffAt = now;
             backlight(false);
             Serial.println("[power] screen off");
+            logHealth("slept");
         } else if (screenOff && idle < 2000) {
             screenOff = false;
             backlight(true);
-            Serial.println("[power] screen on");
+            Serial.printf("[power] screen on (off for %lus)\n",
+                          screenOffAt ? (now - screenOffAt) / 1000UL : 0UL);
+            logHealth("woke");
+            /* The RGB DMA can drift out of sync while nobody is looking at the
+             * panel. Resync on the way back up - a no-op when nothing is wrong. */
+            displayKick("wake");
         }
     }
 
