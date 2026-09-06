@@ -23,6 +23,8 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include <esp_display_panel.hpp>
 #include <esp_lcd_panel_rgb.h>
@@ -35,7 +37,12 @@
 using namespace esp_panel::board;
 using namespace esp_panel::drivers;
 
-#define FIRMWARE_VERSION "0.7"
+#define FIRMWARE_VERSION "0.8"
+
+/* Older config.h files predate the clock page. */
+#ifndef WEATHER_POLL_MS
+#define WEATHER_POLL_MS 600000
+#endif
 
 static Board *board = nullptr;
 static Preferences prefs;
@@ -45,6 +52,7 @@ static char wifiPass[65] = "";
 
 static ui_usage_t usage;
 static ui_ha_t haState;
+static ui_weather_t weather;
 
 /* Requests raised by UI callbacks, serviced in loop(). */
 static volatile bool reqScan = false;
@@ -56,16 +64,19 @@ static volatile int reqLightIdx = -1;
 static volatile int reqLightOn = -1;
 static volatile int reqLightBri = -1;
 static volatile bool reqHaRefresh = false;
+static volatile bool reqWeather = false;
 
 static char pendingSsid[33] = "";
 static char pendingPass[65] = "";
 static bool netPendingSave = false;
 
-static unsigned long lastPoll = 0, lastHaPoll = 0, lastTick = 0;
+static unsigned long lastPoll = 0, lastHaPoll = 0, lastWeatherPoll = 0, lastTick = 0;
 static unsigned long fetchedAt = 0;
 static bool screenOff = false;
 static unsigned long screenOffAt = 0;
 static bool haveUsage = false;
+static bool haveWeather = false;
+static bool timeSynced = false;
 
 /* --------------------------------------------------------------- board --- */
 
@@ -141,6 +152,13 @@ static void logHealth(const char *why)
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
                   (unsigned)ESP.getFreePsram(),
                   (int)WiFi.status(), (int)WiFi.RSSI());
+    time_t t = time(nullptr);
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    Serial.printf("[diag] clock %s %04d-%02d-%02d %02d:%02d:%02d  weather=%s\n",
+                  timeSynced ? "synced" : "UNSET", tmv.tm_year + 1900, tmv.tm_mon + 1,
+                  tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+                  weather.valid ? weather.text : (weather.message[0] ? weather.message : "none"));
 }
 
 static void displayKick(const char *why)
@@ -178,8 +196,9 @@ static void serialCommands()
             break;
         case 'b': backlight(false); Serial.println("[diag] backlight off only"); break;
         case 'B': backlight(true);  Serial.println("[diag] backlight on only"); break;
+        case 'W': reqWeather = true; Serial.println("[diag] weather fetch requested"); break;
         case '?':
-            Serial.println("[diag] i=info r=kick s=sleep w=wake b/B=backlight only");
+            Serial.println("[diag] i=info r=kick s=sleep w=wake b/B=backlight only W=weather");
             break;
         default: break;
         }
@@ -196,6 +215,7 @@ static void loadSettings()
     bool dark = prefs.getBool("dark", true);
     int dim = prefs.getInt("dim", 0);
     int sleep = prefs.getInt("sleep", 0);
+    bool h24 = prefs.getBool("h24", false);
     prefs.end();
 
     snprintf(wifiSsid, sizeof(wifiSsid), "%s", s.c_str());
@@ -203,6 +223,7 @@ static void loadSettings()
     ui_set_theme(dark);
     ui_set_dim(dim);
     ui_set_sleep_index(sleep);
+    ui_set_clock_24h(h24);
     if (s.length()) Serial.printf("[wifi] stored credentials for %s\n", wifiSsid);
 }
 
@@ -221,18 +242,24 @@ static void saveSettings()
     prefs.putBool("dark", ui_get_theme_dark());
     prefs.putInt("dim", ui_get_dim());
     prefs.putInt("sleep", ui_get_sleep_index());
+    prefs.putBool("h24", ui_get_clock_24h());
     prefs.end();
 }
 
 /* ----------------------------------------------------------- callbacks --- */
 /* All of these run on the LVGL task. Set a flag and return - never block here. */
 
-static void cbPage(ui_page_t page)          { if (page == UI_PAGE_HOME) reqHaRefresh = true; }
+static void cbPage(ui_page_t page)
+{
+    if (page == UI_PAGE_HOME) reqHaRefresh = true;
+    if (page == UI_PAGE_CLOCK && !haveWeather) reqWeather = true;
+}
 static void cbThermo(int d)                 { reqThermoDelta += d; }
 static void cbLight(int i, int on, int bri) { reqLightIdx = i; reqLightOn = on; reqLightBri = bri; }
 static void cbTheme(bool)                   { reqSaveSettings = true; }
 static void cbDim(int)                      { reqSaveSettings = true; }
 static void cbSleep(int)                    { reqSaveSettings = true; }
+static void cbClock24h(bool)                { reqSaveSettings = true; }
 static void cbWifiSetup(void)               { reqScan = true; }
 static void cbRescan(void)                  { reqScan = true; }
 static void cbRefresh(void)                 { reqRefresh = true; }
@@ -364,6 +391,76 @@ static bool fetchHA()
     return haState.valid;
 }
 
+/* The clock is set from the bridge, not NTP. The bridge sends the UTC epoch and the
+ * house's UTC offset; the device keeps epoch+offset as its system time and formats
+ * it with gmtime(), so it needs no timezone string and DST is the PC's problem,
+ * re-evaluated every weather poll. Drift between polls is crystal-grade: ~10 ms. */
+static void syncClock(JsonObjectConst t)
+{
+    if (t.isNull()) return;
+    int64_t epoch = t["epoch"] | (int64_t)0;
+    int64_t offset = t["utc_offset"] | (int64_t)0;
+    if (epoch <= 0) return;
+    struct timeval tv;
+    tv.tv_sec = (time_t)(epoch + offset);
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    if (!timeSynced) Serial.printf("[clock] set: %s (utc%+ld)\n",
+                                   t["local"] | "?", (long)offset);
+    timeSynced = true;
+}
+
+static bool fetchWeather()
+{
+    char url[128];
+    bridgeUrl("/weather", url, sizeof(url));
+    JsonDocument doc;
+
+    if (!httpGetJson(url, doc)) {
+        /* Weather changes slowly: keep the last forecast through an outage. The
+         * header already says the bridge is offline. */
+        snprintf(weather.message, sizeof(weather.message), "bridge unreachable");
+        weather.valid = haveWeather;
+    } else {
+        syncClock(doc["time"]);
+        weather.configured = doc["configured"] | false;
+        if (!weather.configured || !(doc["ok"] | false)) {
+            snprintf(weather.message, sizeof(weather.message), "%s", doc["error"] | "error");
+            weather.valid = false;
+        } else {
+            JsonObjectConst c = doc["current"];
+            snprintf(weather.location, sizeof(weather.location), "%s", doc["location"] | "");
+            snprintf(weather.unit, sizeof(weather.unit), "%s", doc["unit"] | "");
+            snprintf(weather.wind_unit, sizeof(weather.wind_unit), "%s", doc["wind_unit"] | "");
+            weather.temp = c["temp"] | 0;
+            weather.feels = c["feels"] | 0;
+            weather.humidity = c["humidity"] | 0;
+            weather.wind = c["wind"] | 0;
+            weather.icon = ui_wx_icon_from_name(c["icon"] | "");
+            snprintf(weather.text, sizeof(weather.text), "%s", c["text"] | "");
+            weather.day_count = 0;
+            for (JsonObjectConst d : doc["daily"].as<JsonArrayConst>()) {
+                if (weather.day_count >= UI_FORECAST_DAYS) break;
+                ui_forecast_t &f = weather.days[weather.day_count++];
+                snprintf(f.day, sizeof(f.day), "%s", d["day"] | "");
+                f.icon = ui_wx_icon_from_name(d["icon"] | "");
+                f.hi = d["hi"] | 0;
+                f.lo = d["lo"] | 0;
+                f.precip = d["precip"] | 0;
+            }
+            weather.valid = true;
+            weather.message[0] = 0;
+            haveWeather = true;
+            Serial.printf("[weather] %s: %s %d%s, %d-day forecast\n", weather.location,
+                          weather.text, weather.temp, weather.unit, weather.day_count);
+        }
+    }
+    lvgl_port_lock(-1);
+    ui_set_weather(&weather);
+    lvgl_port_unlock();
+    return weather.valid;
+}
+
 /* The bridge holds the HA token and knows the entity ids; the device only names
  * the light by index, so entity ids never travel to the panel. */
 static void haCall(const char *json)
@@ -444,6 +541,7 @@ static void netLoop()
         if (netPendingSave) { netPendingSave = false; saveCredentials(); }
         fetchUsage();
         reqHaRefresh = true;
+        reqWeather = true;
         lvgl_port_lock(-1);
         ui_show_page(UI_PAGE_USAGE);
         lvgl_port_unlock();
@@ -497,6 +595,7 @@ void setup()
 
     memset(&usage, 0, sizeof(usage));
     memset(&haState, 0, sizeof(haState));
+    memset(&weather, 0, sizeof(weather));
 
     ui_callbacks_t cb = {};
     cb.page_changed = cbPage;
@@ -505,16 +604,20 @@ void setup()
     cb.theme_changed = cbTheme;
     cb.dim_changed = cbDim;
     cb.sleep_changed = cbSleep;
+    cb.clock_24h_changed = cbClock24h;
     cb.wifi_setup_requested = cbWifiSetup;
     cb.wifi_connect = cbWifiConnect;
     cb.wifi_rescan = cbRescan;
     cb.refresh_requested = cbRefresh;
 
+    /* loadSettings() pokes the theme, dim sheet and clock format into live widgets,
+     * and the LVGL task is already rendering the first frame by now. Without the
+     * lock that is a write into a dirty area mid-render - LVGL logs exactly that
+     * ("_lv_inv_area: detected modifying dirty areas in render") at every boot. */
     lvgl_port_lock(-1);
     ui_init(&cb);
-    lvgl_port_unlock();
-
     loadSettings();
+    lvgl_port_unlock();
 
     WiFi.onEvent(onWiFiEvent);
     if (strlen(wifiSsid) == 0) {
@@ -556,11 +659,18 @@ void loop()
         reqRefresh = false;
         if (online) fetchUsage();
         lastPoll = now;
+        reqWeather = true;
     }
 
     if (online && !onSetup && now - lastPoll >= POLL_INTERVAL_MS) {
         lastPoll = now;
         fetchUsage();
+    }
+
+    if (online && !onSetup && (reqWeather || now - lastWeatherPoll >= WEATHER_POLL_MS)) {
+        reqWeather = false;
+        lastWeatherPoll = now;
+        fetchWeather();
     }
 
     if (online && !onSetup) {
@@ -611,11 +721,28 @@ void loop()
         else if (age > 90)           st = UI_STATUS_STALE;
         else                         st = UI_STATUS_CONNECTED;
 
+        /* System time holds local seconds (see syncClock), so gmtime is local. */
+        ui_clock_t clk = {};
+        if (timeSynced) {
+            time_t t = time(nullptr);
+            struct tm tmv;
+            gmtime_r(&t, &tmv);
+            clk.valid = true;
+            clk.hour = tmv.tm_hour;
+            clk.minute = tmv.tm_min;
+            clk.second = tmv.tm_sec;
+            clk.weekday = tmv.tm_wday;
+            clk.day = tmv.tm_mday;
+            clk.month = tmv.tm_mon + 1;
+            clk.year = tmv.tm_year + 1900;
+        }
+
         lvgl_port_lock(-1);
         ui_set_network_info(wifiSsid,
                             online ? WiFi.localIP().toString().c_str() : "",
                             BRIDGE_URL, FIRMWARE_VERSION);
         ui_set_status(st, age);
+        ui_set_clock(&clk);
         ui_tick(now);
         uint32_t idle = lv_disp_get_inactive_time(NULL);
         lvgl_port_unlock();

@@ -104,6 +104,7 @@ static void cb_light_set(int i, int on, int bri) { printf("[cb] light_set(index=
 static void cb_theme_changed(bool dark)          { printf("[cb] theme_changed(dark=%s)\n", dark ? "true" : "false"); }
 static void cb_dim_changed(int percent)          { printf("[cb] dim_changed(%d%%)\n", percent); }
 static void cb_sleep_changed(int index)          { printf("[cb] sleep_changed(index=%d)\n", index); }
+static void cb_clock_24h_changed(bool on)        { printf("[cb] clock_24h_changed(%s)\n", on ? "true" : "false"); }
 static void cb_wifi_setup_requested(void)        { printf("[cb] wifi_setup_requested()\n"); }
 static void cb_wifi_rescan(void)                 { printf("[cb] wifi_rescan()\n"); }
 static void cb_refresh_requested(void)           { printf("[cb] refresh_requested()\n"); }
@@ -122,6 +123,7 @@ static const ui_callbacks_t g_callbacks = {
     .theme_changed        = cb_theme_changed,
     .dim_changed          = cb_dim_changed,
     .sleep_changed        = cb_sleep_changed,
+    .clock_24h_changed    = cb_clock_24h_changed,
     .wifi_setup_requested = cb_wifi_setup_requested,
     .wifi_connect         = cb_wifi_connect,
     .wifi_rescan          = cb_wifi_rescan,
@@ -135,7 +137,8 @@ typedef enum {
     ST_STALE,
     ST_NOWIFI,
     ST_BRIDGE,
-    ST_LIMIT
+    ST_LIMIT,
+    ST_NOTOKEN
 } sim_state_t;
 
 static void gauge_set(ui_gauge_t *g, float pct, long used, long limit,
@@ -164,9 +167,20 @@ static void fill_usage(ui_usage_t *u, sim_state_t state)
         return;
     }
 
+    if (state == ST_NOTOKEN) {
+        /* What the bridge really serves with no usable token: local estimates
+         * the panel now refuses to render as percentages. */
+        gauge_set(&u->session, 9.6f,  48, 500,   4920, "fallback");
+        gauge_set(&u->week,   38.2f, 764, 2000, 259200, "fallback");
+        gauge_set(&u->model,  39.2f, 235, 600, 259200, "fallback");
+        return;
+    }
+
+    /* The live shape: two real headers, and the per-model gauge rescaled from
+     * them because Anthropic publishes no per-model header. */
     gauge_set(&u->session, 62.4f, 187, 300,   4920, "api");
-    gauge_set(&u->week,    41.0f,  82, 200, 259200, "api-scaled");
-    gauge_set(&u->model,   78.5f, 157, 200, 259200, "calibrated");
+    gauge_set(&u->week,    41.0f,  82, 200, 259200, "api");
+    gauge_set(&u->model,   78.5f, 157, 200, 259200, "api-scaled");
 }
 
 static void fill_ha(ui_ha_t *h, sim_state_t state)
@@ -199,6 +213,67 @@ static void fill_ha(ui_ha_t *h, sim_state_t state)
     h->lights[1].on = false; h->lights[1].brightness = 0;
     snprintf(h->lights[2].name, sizeof h->lights[2].name, "Hallway");
     h->lights[2].on = true;  h->lights[2].brightness = 96;
+}
+
+/* 3:42 PM on Sunday 6 September 2026 - or 10:42 PM with --night, which also
+ * swaps in the night-time glyphs. Fixed, like everything else here. */
+static void fill_clock(ui_clock_t *c, sim_state_t state, bool night)
+{
+    memset(c, 0, sizeof *c);
+    if (state == ST_NOWIFI) return;          /* never synced: renders "--:--" */
+    c->valid   = true;
+    c->hour    = night ? 22 : 15;
+    c->minute  = 42;
+    c->second  = 7;
+    c->weekday = 0;
+    c->day     = 6;
+    c->month   = 9;
+    c->year    = 2026;
+}
+
+static void fill_weather(ui_weather_t *w, sim_state_t state, bool night)
+{
+    memset(w, 0, sizeof *w);
+    w->configured = true;
+
+    if (state == ST_BRIDGE || state == ST_NOWIFI) {
+        w->valid = false;
+        snprintf(w->message, sizeof w->message, "%s",
+                 state == ST_NOWIFI ? "No Wi-Fi - weather unavailable"
+                                    : "Bridge offline - last sync 4 min ago");
+        return;
+    }
+
+    w->valid = true;
+    snprintf(w->location,  sizeof w->location,  "Home");
+    snprintf(w->unit,      sizeof w->unit,      "F");
+    snprintf(w->wind_unit, sizeof w->wind_unit, "mph");
+    w->temp = night ? 61 : 73;
+    w->feels = night ? 59 : 74;
+    w->humidity = 39;
+    w->wind = 5;
+    w->icon = night ? UI_WX_MOON : UI_WX_PARTLY;
+    snprintf(w->text, sizeof w->text, night ? "Clear" : "Partly cloudy");
+
+    /* One of every glyph family across the two variants. */
+    static const struct { const char *day; ui_wx_icon_t icon; int hi, lo; } days[UI_FORECAST_DAYS] = {
+        {"Sun", UI_WX_SUN,   74, 64},
+        {"Mon", UI_WX_CLOUD, 80, 58},
+        {"Tue", UI_WX_RAIN,  71, 55},
+        {"Wed", UI_WX_STORM, 69, 57},
+        {"Thu", UI_WX_SNOW,  41, 28},
+    };
+    w->day_count = UI_FORECAST_DAYS;
+    for (int i = 0; i < UI_FORECAST_DAYS; i++) {
+        snprintf(w->days[i].day, sizeof w->days[i].day, "%s", days[i].day);
+        w->days[i].icon = days[i].icon;
+        w->days[i].hi = days[i].hi;
+        w->days[i].lo = days[i].lo;
+    }
+    if (night) {
+        w->days[0].icon = UI_WX_FOG;
+        w->days[1].icon = UI_WX_PARTLY_NIGHT;
+    }
 }
 
 static void apply_status(sim_state_t state)
@@ -309,10 +384,12 @@ static void usage_text(const char *argv0)
     printf(
         "usage: %s [options]\n"
         "\n"
-        "  --page {usage|home|settings}   which page to show      (default: usage)\n"
+        "  --page {usage|clock|home|settings}\n"
+        "                                 which page to show      (default: usage)\n"
         "  --theme {dark|light}           colour scheme           (default: dark)\n"
         "  --state {ok|stale|nowifi|bridge|limit}\n"
         "                                 connection / data state (default: ok)\n"
+        "  --night                        10:42 PM and night-time weather glyphs\n"
         "  --wifi                         show the Wi-Fi setup screen instead\n"
         "  --dim N                        software dim overlay, 0..70 (default: 0)\n"
         "  --out PATH                     PNG to write     (default: shots/out.png)\n"
@@ -323,6 +400,7 @@ static void usage_text(const char *argv0)
 static int parse_page(const char *s, ui_page_t *out)
 {
     if (!strcmp(s, "usage"))    { *out = UI_PAGE_USAGE;    return 0; }
+    if (!strcmp(s, "clock"))    { *out = UI_PAGE_CLOCK;    return 0; }
     if (!strcmp(s, "home"))     { *out = UI_PAGE_HOME;     return 0; }
     if (!strcmp(s, "settings")) { *out = UI_PAGE_SETTINGS; return 0; }
     return -1;
@@ -335,6 +413,7 @@ static int parse_state(const char *s, sim_state_t *out)
     if (!strcmp(s, "nowifi")) { *out = ST_NOWIFI; return 0; }
     if (!strcmp(s, "bridge")) { *out = ST_BRIDGE; return 0; }
     if (!strcmp(s, "limit"))  { *out = ST_LIMIT;  return 0; }
+    if (!strcmp(s, "notoken")) { *out = ST_NOTOKEN; return 0; }
     return -1;
 }
 
@@ -344,12 +423,14 @@ int main(int argc, char **argv)
     bool        dark    = true;
     sim_state_t state   = ST_OK;
     bool        do_wifi = false;
+    bool        night   = false;
     int         dim     = 0;
     const char *out     = "shots/out.png";
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        int takes_value = strcmp(a, "--wifi") && strcmp(a, "--help") && strcmp(a, "-h");
+        int takes_value = strcmp(a, "--wifi") && strcmp(a, "--night") &&
+                          strcmp(a, "--help") && strcmp(a, "-h");
 
         if (takes_value && i + 1 >= argc) {
             fprintf(stderr, "sim: %s needs a value\n", a);
@@ -362,6 +443,9 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(a, "--wifi")) {
             do_wifi = true;
+        }
+        else if (!strcmp(a, "--night")) {
+            night = true;
         }
         else if (!strcmp(a, "--page")) {
             if (parse_page(argv[++i], &page) != 0) {
@@ -415,12 +499,18 @@ int main(int argc, char **argv)
     ui_set_dim(dim);
 
     {
-        ui_usage_t u;
-        ui_ha_t    h;
+        ui_usage_t   u;
+        ui_ha_t      h;
+        ui_weather_t w;
+        ui_clock_t   c;
         fill_usage(&u, state);
         fill_ha(&h, state);
+        fill_weather(&w, state, night);
+        fill_clock(&c, state, night);
         ui_set_usage(&u);
         ui_set_ha(&h);
+        ui_set_weather(&w);
+        ui_set_clock(&c);
     }
 
     ui_set_network_info(state == ST_NOWIFI ? "" : "Tanagra",
@@ -438,6 +528,16 @@ int main(int argc, char **argv)
     }
 
     settle();
+
+    /* The LVGL heap is capped at what the ESP32 has (LV_MEM_SIZE), so this is the
+     * one number that says whether a page will fit on the device. */
+    {
+        lv_mem_monitor_t mon;
+        lv_mem_monitor(&mon);
+        printf("sim: lvgl heap %u%% used, %u bytes free, largest block %u, frag %u%%\n",
+               (unsigned)mon.used_pct, (unsigned)mon.free_size,
+               (unsigned)mon.free_biggest_size, (unsigned)mon.frag_pct);
+    }
 
     if (do_wifi && !ui_wifi_is_active())
         fprintf(stderr, "sim: warning - asked for the wifi screen but "

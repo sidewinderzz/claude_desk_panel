@@ -126,6 +126,10 @@ shots: $(BIN)
 	@mkdir -p $(SHOTS)
 	./$(BIN) --page usage    --theme dark               --out $(SHOTS)/usage-dark.png
 	./$(BIN) --page usage    --theme light              --out $(SHOTS)/usage-light.png
+	./$(BIN) --page clock    --theme dark               --out $(SHOTS)/clock-dark.png
+	./$(BIN) --page clock    --theme light              --out $(SHOTS)/clock-light.png
+	./$(BIN) --page clock    --theme dark --night       --out $(SHOTS)/clock-night.png
+	./$(BIN) --page clock    --theme dark --state nowifi --out $(SHOTS)/clock-nowifi.png
 	./$(BIN) --page home     --theme dark               --out $(SHOTS)/home-dark.png
 	./$(BIN) --page home     --theme light              --out $(SHOTS)/home-light.png
 	./$(BIN) --page settings --theme light              --out $(SHOTS)/settings-light.png
@@ -134,6 +138,7 @@ shots: $(BIN)
 	./$(BIN) --page usage    --theme dark --state nowifi --out $(SHOTS)/nowifi.png
 	./$(BIN) --page usage    --theme dark --state bridge --out $(SHOTS)/bridge.png
 	./$(BIN) --page usage    --theme dark --state limit  --out $(SHOTS)/limit.png
+	./$(BIN) --page usage    --theme dark --state notoken --out $(SHOTS)/notoken.png
 	./$(BIN) --wifi          --theme dark               --out $(SHOTS)/wifi.png
 	./$(BIN) --page usage    --theme dark --dim 40      --out $(SHOTS)/usage-dim40.png
 	@echo "--- $(SHOTS)/ ---"

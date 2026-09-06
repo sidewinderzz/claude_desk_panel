@@ -1,0 +1,8 @@
+{
+  "_comment": "Optional. Without this file the bridge asks Home Assistant where the house is. units: f or c. timezone: an IANA name; leave it out to use the PC's own zone.",
+  "latitude": 40.7128,
+  "longitude": -74.0060,
+  "timezone": "America/New_York",
+  "units": "f",
+  "name": "Home"
+}

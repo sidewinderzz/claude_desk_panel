@@ -1,5 +1,6 @@
 # Credentials and per-machine state - never commit these.
 bridge/ha_config.json
+bridge/weather_config.json
 bridge/token.txt
 bridge/calibration.json
 firmware/*/config.h
@@ -8,6 +9,7 @@ firmware/*/config.h
 # Edit the originals, not the copies.
 firmware/claude_widget_lvgl/ui.c
 firmware/claude_widget_lvgl/ui.h
+firmware/claude_widget_lvgl/font_clock_112.c
 firmware/claude_widget_lvgl/claude_logo.c
 firmware/claude_widget_lvgl/claude_logo.h
 

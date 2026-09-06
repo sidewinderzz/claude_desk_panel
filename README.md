@@ -1,14 +1,18 @@
 # Claude Desk Panel
 
 A desk display for a **Waveshare ESP32-S3-Touch-LCD-4.3B** (800×480 RGB, GT911 touch):
-how much of your Claude usage window you've burned through, plus Home Assistant
-controls. Three pages, swipe between them.
+how much of your Claude usage window you've burned through, a clock with the weather,
+and Home Assistant controls. Four pages, swipe between them.
 
 ![Claude Usage page](docs/screenshots/usage-dark.png)
 
-| Office | Settings |
+| Clock | Office |
 | --- | --- |
-| ![Office page](docs/screenshots/home-dark.png) | ![Settings page](docs/screenshots/settings-dark.png) |
+| ![Clock page](docs/screenshots/clock-dark.png) | ![Office page](docs/screenshots/home-dark.png) |
+
+| Clock at night | Settings |
+| --- | --- |
+| ![Clock page at night](docs/screenshots/clock-night.png) | ![Settings page](docs/screenshots/settings-dark.png) |
 
 
 | | |
@@ -17,7 +21,7 @@ controls. Three pages, swipe between them.
 | `ui/` | The entire UI. Pure LVGL 8 / C99 — no Arduino, no ESP-IDF. |
 | `sim/` | Headless renderer: builds `ui.c` with gcc, writes 800×480 PNGs. |
 | `firmware/` | Board bring-up, Wi-Fi, HTTP, NVS. |
-| `assets/` | Rasterises the Claude mark into an LVGL alpha map. |
+| `assets/` | Rasterises the Claude mark into an LVGL alpha map; generates the clock face. |
 | `design/` | Design-canvas artboards tracing the firmware layout. |
 
 The panel holds no credentials but your Wi-Fi password, which you type on it.
@@ -27,14 +31,15 @@ The panel holds no credentials but your Wi-Fi password, which you type on it.
 ## The interesting part: the UI is hardware-independent
 
 `ui/ui.c` has no Arduino, ESP-IDF or board headers. Data goes in through
-`ui_set_usage()` / `ui_set_ha()` / `ui_set_status()`; actions come back through a
-callback struct. The firmware supplies one implementation, `sim/` supplies another.
+`ui_set_usage()` / `ui_set_ha()` / `ui_set_weather()` / `ui_set_clock()` /
+`ui_set_status()`; actions come back through a callback struct. The firmware
+supplies one implementation, `sim/` supplies another.
 
 So the same file that runs on the panel also builds on a PC and renders to PNG:
 
 ```bash
-cd sim && make -j && make shots      # 12 scenarios into sim/shots/
-./sim --page home --theme light --out shot.png
+cd sim && make -j && make shots      # 16 scenarios into sim/shots/
+./sim --page clock --theme light --night --out shot.png
 ```
 
 A layout change is a two-second loop instead of a 35-second flash, and every state —
@@ -51,9 +56,39 @@ Every screenshot in this README came out of it:
 | ![Office page, light theme](docs/screenshots/home-light.png) | ![Limit reached](docs/screenshots/limit.png) |
 
 The rest are in [`docs/screenshots/`](docs/screenshots) - stale data, bridge offline,
-no Wi-Fi, dimmed.
+no Wi-Fi, dimmed, the clock before its first sync.
 
 Needs gcc. On Windows, WSL works: `sudo apt install build-essential`.
+
+---
+
+## Clock and weather
+
+The panel has no idea where it is or what time it is. The PC next to it knows both,
+so the bridge's `/weather` endpoint carries current conditions, a five-day forecast
+**and the local time**, and the panel sets its clock from that reply every ten
+minutes. No NTP, no timezone string in the firmware: DST is worked out on the PC,
+and the panel keeps time from its own crystal between polls (drift is ~10 ms).
+
+**Location.** Nothing to configure if Home Assistant is set up: the bridge reads
+the house's coordinates, timezone and unit system from HA's `/api/config`. Without
+HA, copy `bridge/weather_config.example.json` to `weather_config.json` and fill in
+latitude, longitude and `"units": "f"` or `"c"`. Weather comes from
+[Open-Meteo](https://open-meteo.com/) - free, no key, no account. Check what the
+panel will see with:
+
+```bash
+python bridge/claude_usage_bridge.py --weather
+```
+
+**The glyphs are drawn, not drawn on.** Nine weather families (sun, moon, partly
+cloudy day/night, cloud, fog, rain, snow, storm) are built from LVGL discs and
+lines inside a fixed box, so they tint with the theme and cost no image assets.
+The bridge maps WMO weather codes onto those families; the firmware never sees a
+code. The 112px clock face is Montserrat, digits only, generated from the TTF that
+ships inside the LVGL library by `assets/make_clock_font.ps1` (needs node).
+
+A **24-hour clock** switch lives on the Settings page and is remembered in NVS.
 
 ---
 
@@ -158,6 +193,9 @@ PC. Wi-Fi is configured on the device itself; the `WIFI_*` defines are fallbacks
 | lvgl | 8.4.0 | LVGL 9 is an API break |
 | ArduinoJson | 7.x | |
 
+`ui/ui.c`, `ui/ui.h`, `ui/font_clock_112.c` and the logo are copied into the sketch
+folder by `build.ps1`; edit the originals.
+
 Four config headers live in the Arduino `libraries/` root, not the sketch:
 `lv_conf.h`, `esp_panel_board_supported_conf.h`, `esp_panel_drivers_conf.h`,
 `esp_utils_conf.h`. Editing any of them needs a clean build.
@@ -200,8 +238,9 @@ Arduino_GFX build kept as a fallback.
 
 ## Credentials
 
-`ha_config.json`, `token.txt` and `config.h` are gitignored, with `.example` files
-alongside. Nothing in this repo is a secret; check before you commit.
+`ha_config.json`, `weather_config.json`, `token.txt` and `config.h` are gitignored,
+with `.example` files alongside. Nothing in this repo is a secret; check before you
+commit.
 
 ## Licence
 

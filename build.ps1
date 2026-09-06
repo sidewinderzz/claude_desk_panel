@@ -43,6 +43,7 @@ if (-not $Gfx) {
     $sync = @(
         @{ From = Join-Path $PSScriptRoot 'ui\ui.c';             To = 'ui.c' }
         @{ From = Join-Path $PSScriptRoot 'ui\ui.h';             To = 'ui.h' }
+        @{ From = Join-Path $PSScriptRoot 'ui\font_clock_112.c'; To = 'font_clock_112.c' }
         @{ From = Join-Path $PSScriptRoot 'assets\claude_logo.c'; To = 'claude_logo.c' }
         @{ From = Join-Path $PSScriptRoot 'assets\claude_logo.h'; To = 'claude_logo.h' }
     )

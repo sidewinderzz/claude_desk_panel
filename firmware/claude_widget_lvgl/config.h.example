@@ -32,3 +32,8 @@
 // long is what keeps the panel feeling responsive on a network that isn't there.
 #define WIFI_CONNECT_MS 20000
 #define WIFI_RETRY_MS 60000
+
+// Weather and clock, from the bridge's /weather endpoint. Open-Meteo refreshes its
+// current conditions every 15 minutes and the bridge caches for 10, so there is no
+// point polling faster than this. The clock is re-synced from the same reply.
+#define WEATHER_POLL_MS 600000

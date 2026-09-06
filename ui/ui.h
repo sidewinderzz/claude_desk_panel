@@ -29,8 +29,9 @@ extern "C" {
 
 typedef enum {
     UI_PAGE_USAGE = 0,
-    UI_PAGE_HOME = 1,
-    UI_PAGE_SETTINGS = 2,
+    UI_PAGE_CLOCK = 1,
+    UI_PAGE_HOME = 2,
+    UI_PAGE_SETTINGS = 3,
     UI_PAGE_COUNT
 } ui_page_t;
 
@@ -88,6 +89,52 @@ typedef struct {
     ui_light_t lights[UI_MAX_LIGHTS];
 } ui_ha_t;
 
+/* Weather glyph families. The bridge maps WMO codes onto these, so the device
+ * carries no weather table; ui_wx_icon_from_name() parses the bridge's strings. */
+typedef enum {
+    UI_WX_NONE = 0,
+    UI_WX_SUN,
+    UI_WX_MOON,
+    UI_WX_PARTLY,            /* sun behind cloud */
+    UI_WX_PARTLY_NIGHT,      /* moon behind cloud */
+    UI_WX_CLOUD,
+    UI_WX_FOG,
+    UI_WX_RAIN,
+    UI_WX_SNOW,
+    UI_WX_STORM
+} ui_wx_icon_t;
+
+#define UI_FORECAST_DAYS 5
+
+typedef struct {
+    char day[8];             /* "Sat" */
+    ui_wx_icon_t icon;
+    int hi, lo;              /* already in the display unit */
+    int precip;              /* chance of precipitation, 0..100 */
+} ui_forecast_t;
+
+typedef struct {
+    bool configured;         /* the bridge knows a location */
+    bool valid;              /* at least one good fetch */
+    char message[80];        /* shown instead of values when !valid */
+    char location[32];
+    char unit[4];            /* "F" / "C" */
+    char wind_unit[8];       /* "mph" / "km/h" */
+    int temp, feels, humidity, wind;
+    ui_wx_icon_t icon;
+    char text[32];           /* "Partly cloudy" */
+    int day_count;
+    ui_forecast_t days[UI_FORECAST_DAYS];
+} ui_weather_t;
+
+/* Local wall-clock time, already broken down. The UI never reads a clock itself. */
+typedef struct {
+    bool valid;              /* false until the clock has been set -> "--:--" */
+    int hour, minute, second;/* 24-hour */
+    int weekday;             /* 0 = Sunday */
+    int day, month, year;    /* month 1..12 */
+} ui_clock_t;
+
 typedef struct {
     char ssid[33];
     int32_t rssi;
@@ -101,6 +148,7 @@ typedef struct {
     void (*theme_changed)(bool dark);
     void (*dim_changed)(int percent);               /* 0..70, on release */
     void (*sleep_changed)(int index);               /* index into ui_sleep_ms[] */
+    void (*clock_24h_changed)(bool on);
     void (*wifi_setup_requested)(void);
     void (*wifi_connect)(const char *ssid, const char *password);
     void (*wifi_rescan)(void);
@@ -120,10 +168,12 @@ void ui_init(const ui_callbacks_t *cb);
 void ui_set_theme(bool dark);
 void ui_set_dim(int percent);          /* 0..70 software dim overlay */
 void ui_set_sleep_index(int index);
+void ui_set_clock_24h(bool on);
 
 bool ui_get_theme_dark(void);
 int  ui_get_dim(void);
 int  ui_get_sleep_index(void);
+bool ui_get_clock_24h(void);
 
 void ui_show_page(ui_page_t page);
 ui_page_t ui_get_page(void);
@@ -132,9 +182,14 @@ ui_page_t ui_get_page(void);
  * unless the rendered value actually changed. */
 void ui_set_usage(const ui_usage_t *usage);
 void ui_set_ha(const ui_ha_t *ha);
+void ui_set_weather(const ui_weather_t *weather);
+void ui_set_clock(const ui_clock_t *clock);
 void ui_set_status(ui_status_t status, uint32_t synced_age_s);
 void ui_set_network_info(const char *ssid, const char *ip, const char *bridge_url,
                          const char *firmware_version);
+
+/* "sun", "moon", "partly", "partly-night", "cloud", "fog", "rain", "snow", "storm". */
+ui_wx_icon_t ui_wx_icon_from_name(const char *name);
 
 /* Countdowns. `now_ms` is any monotonic millisecond clock; the UI diffs it against
  * the value passed to ui_set_usage() rather than calling a clock itself. */

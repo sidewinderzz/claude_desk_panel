@@ -51,9 +51,10 @@ make ARDUINO_LIBS=/some/other/libraries
 
 | Flag | Values | Meaning |
 | --- | --- | --- |
-| `--page` | `usage` \| `home` \| `settings` | Which page to load. Default `usage`. |
+| `--page` | `usage` \| `clock` \| `home` \| `settings` | Which page to load. Default `usage`. |
 | `--theme` | `dark` \| `light` | Colour scheme, applied both before and after `ui_init()`. Default `dark`. |
-| `--state` | `ok` \| `stale` \| `nowifi` \| `bridge` \| `limit` | Connection/data state. Drives `ui_set_status()` and reshapes the fake usage and Home Assistant payloads. Default `ok`. |
+| `--state` | `ok` \| `stale` \| `nowifi` \| `bridge` \| `limit` | Connection/data state. Drives `ui_set_status()` and reshapes the fake usage, weather and Home Assistant payloads. Default `ok`. |
+| `--night` | (no value) | 10:42 PM instead of 3:42 PM, with the moon, fog and night-time partly-cloudy glyphs in the weather. |
 | `--wifi` | (no value) | Show the Wi-Fi setup screen with a fake scan list instead of a page. |
 | `--dim N` | `0`–`70` | Software dim overlay percentage. Clamped. Default `0`. |
 | `--out PATH` | path | PNG to write. Parent directories are created. Default `shots/out.png`. |
@@ -61,13 +62,13 @@ make ARDUINO_LIBS=/some/other/libraries
 
 ### What each `--state` feeds in
 
-| State | `ui_set_status()` | Usage | Home Assistant |
-| --- | --- | --- | --- |
-| `ok` | `CONNECTED`, 12s | 62% session / 41% week / 79% model, sources `api`, `api-scaled`, `calibrated` | valid, Living Room 21.5→22.0 heating, 3 lights |
-| `stale` | `STALE`, 930s | same | valid |
-| `nowifi` | `NO_WIFI`, 3600s | same; SSID and IP blanked | invalid, with a message |
-| `bridge` | `BRIDGE_OFFLINE`, 244s | same | invalid, with a message |
-| `limit` | `LIMIT_REACHED`, 8s | `blocked = true`, session pinned at 100%, resets in 45m | valid |
+| State | `ui_set_status()` | Usage | Home Assistant | Clock / weather |
+| --- | --- | --- | --- | --- |
+| `ok` | `CONNECTED`, 12s | 62% session / 41% week / 79% model, sources `api`, `api-scaled`, `calibrated` | valid, Living Room 21.5→22.0 heating, 3 lights | 3:42 PM Sun 6 Sep 2026; 73° partly cloudy, five-day forecast |
+| `stale` | `STALE`, 930s | same | valid | same |
+| `nowifi` | `NO_WIFI`, 3600s | same; SSID and IP blanked | invalid, with a message | clock never synced (`--:--`), weather invalid |
+| `bridge` | `BRIDGE_OFFLINE`, 244s | same | invalid, with a message | clock valid, weather invalid |
+| `limit` | `LIMIT_REACHED`, 8s | `blocked = true`, session pinned at 100%, resets in 45m | valid | same as `ok` |
 
 ## Files
 
@@ -121,6 +122,11 @@ which is irrelevant for screenshots.
   render. Run it under `timeout 60 ./sim ...` and attach gdb to the spin.
 - **Only montserrat 14/20/28/48 are compiled in.** Referencing any other size
   fails at link time, not compile time, with an undefined `lv_font_montserrat_NN`.
+  The one exception is `font_clock_112` in `ui/font_clock_112.c` - digits, `:`, `-`
+  and `.` only, so any other character in the time label simply does not draw.
+- **The sim prints LVGL heap use after every render.** `LV_MEM_SIZE` is the
+  device's 128 KB, so "56% used" here means the same on the panel. Watch it when
+  adding widgets.
 - **`--state limit` never goes quiet.** The "LIMIT REACHED" label animates
   continuously, so the settle loop hits its 80-iteration cap and prints a
   warning. That is expected and the shot is still correct; the warning is only

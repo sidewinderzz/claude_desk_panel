@@ -24,6 +24,7 @@ transcripts gives a lower bound on the 5-hour budget, and failing that a generic
 
 Endpoints:
     GET /usage    the payload the device polls
+    GET /weather  current conditions, 5-day forecast and the local time (see below)
     GET /health   liveness
     GET /dump     verbose breakdown for debugging
 
@@ -394,6 +395,7 @@ def calibrate(spec):
 
 import urllib.request
 import urllib.error
+import urllib.parse
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt")
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -842,6 +844,273 @@ def ha_call(body):
 
 
 # --------------------------------------------------------------------------------------
+# Weather + clock
+#
+# The panel knows neither where it is nor what time it is; the PC next to it knows
+# both. GET /weather returns current conditions and a five-day forecast from
+# Open-Meteo (free, no key, no account) for the house's coordinates, plus the local
+# time so the panel can set its clock without NTP or a timezone string of its own.
+#
+# Location: bridge/weather_config.json if present, otherwise Home Assistant's own
+# /api/config - it already knows where the house is, what zone it is in and whether
+# it thinks in Fahrenheit. Weather is cached for ten minutes; the time is fresh on
+# every request because the panel sets its clock from it.
+# --------------------------------------------------------------------------------------
+
+WEATHER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weather_config.json")
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_CACHE_SECONDS = 600
+WEATHER_RETRY_SECONDS = 60
+LOCATION_CACHE_SECONDS = 3600
+
+# WMO weather interpretation codes -> (text, glyph family). The panel draws the nine
+# glyph families itself and never sees a WMO code.
+WMO_CODES = {
+    0: ("Clear", "sun"),
+    1: ("Mostly clear", "sun"),
+    2: ("Partly cloudy", "partly"),
+    3: ("Overcast", "cloud"),
+    45: ("Fog", "fog"),
+    48: ("Freezing fog", "fog"),
+    51: ("Light drizzle", "rain"),
+    53: ("Drizzle", "rain"),
+    55: ("Heavy drizzle", "rain"),
+    56: ("Freezing drizzle", "rain"),
+    57: ("Freezing drizzle", "rain"),
+    61: ("Light rain", "rain"),
+    63: ("Rain", "rain"),
+    65: ("Heavy rain", "rain"),
+    66: ("Freezing rain", "rain"),
+    67: ("Freezing rain", "rain"),
+    71: ("Light snow", "snow"),
+    73: ("Snow", "snow"),
+    75: ("Heavy snow", "snow"),
+    77: ("Snow grains", "snow"),
+    80: ("Light showers", "rain"),
+    81: ("Showers", "rain"),
+    82: ("Heavy showers", "rain"),
+    85: ("Snow showers", "snow"),
+    86: ("Heavy snow showers", "snow"),
+    95: ("Thunderstorm", "storm"),
+    96: ("Thunderstorm, hail", "storm"),
+    99: ("Thunderstorm, hail", "storm"),
+}
+
+
+def describe_wmo(code, is_day=True):
+    try:
+        text, icon = WMO_CODES[int(code)]
+    except (KeyError, TypeError, ValueError):
+        text, icon = "Unknown", "cloud"
+    if not is_day:
+        icon = {"sun": "moon", "partly": "partly-night"}.get(icon, icon)
+    return text, icon
+
+
+_location_cache = {"at": 0.0, "data": None}
+
+
+def weather_location():
+    """{latitude, longitude, timezone, units, name, source} or None if nobody knows."""
+    cfg = {}
+    try:
+        with open(WEATHER_CONFIG_FILE, "r", encoding="utf-8") as handle:
+            cfg = json.load(handle)
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if cfg.get("latitude") is not None and cfg.get("longitude") is not None:
+        try:
+            return {
+                "latitude": float(cfg["latitude"]),
+                "longitude": float(cfg["longitude"]),
+                "timezone": cfg.get("timezone") or None,
+                "units": "c" if str(cfg.get("units", "f")).lower().startswith("c") else "f",
+                "name": str(cfg.get("name") or "Home"),
+                "source": "weather_config.json",
+            }
+        except (TypeError, ValueError):
+            log("[weather] weather_config.json has a bad latitude/longitude")
+
+    if time.time() - _location_cache["at"] < LOCATION_CACHE_SECONDS:
+        return _location_cache["data"]
+
+    loc = None
+    ha = ha_config()
+    if ha is not None:
+        try:
+            c = ha_request(ha, "GET", "/api/config") or {}
+            if c.get("latitude") is not None and c.get("longitude") is not None:
+                unit = str((c.get("unit_system") or {}).get("temperature", "F"))
+                loc = {
+                    "latitude": float(c["latitude"]),
+                    "longitude": float(c["longitude"]),
+                    "timezone": c.get("time_zone") or None,
+                    "units": "c" if unit.upper().endswith("C") else "f",
+                    "name": str(c.get("location_name") or "Home"),
+                    "source": "home assistant",
+                }
+        except (urllib.error.URLError, OSError, ValueError, TypeError, AttributeError) as exc:
+            log("[weather] Home Assistant location lookup failed: %s" % exc)
+    _location_cache.update(at=time.time(), data=loc)
+    return loc
+
+
+def local_clock(tz_name):
+    """The panel's clock, as {epoch, utc_offset, tz}. The panel keeps epoch+utc_offset
+    as its system time and formats it as UTC, so DST is entirely this function's
+    problem, re-evaluated every time the panel asks."""
+    now = datetime.now(timezone.utc)
+    tz = None
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            # No tz database on this box (Windows without the tzdata package). The
+            # PC sits next to the panel, so its own zone is the next best thing.
+            tz = None
+    local = now.astimezone(tz) if tz else now.astimezone()
+    offset = local.utcoffset() or timedelta(0)
+    return {
+        "epoch": int(now.timestamp()),
+        "utc_offset": int(offset.total_seconds()),
+        "tz": tz_name if tz else str(local.tzname()),
+        "local": local.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def fetch_open_meteo(loc):
+    imperial = loc["units"] == "f"
+    params = {
+        "latitude": "%.4f" % loc["latitude"],
+        "longitude": "%.4f" % loc["longitude"],
+        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                   "weather_code,wind_speed_10m,is_day",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                 "precipitation_probability_max",
+        "temperature_unit": "fahrenheit" if imperial else "celsius",
+        "wind_speed_unit": "mph" if imperial else "kmh",
+        "timezone": loc.get("timezone") or "auto",
+        "forecast_days": "5",
+    }
+    req = urllib.request.Request(
+        OPEN_METEO_URL + "?" + urllib.parse.urlencode(params),
+        headers={"User-Agent": "claude-desk-panel"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = json.loads(resp.read())
+
+    def whole(value):
+        return None if value is None else int(round(float(value)))
+
+    cur = raw.get("current") or {}
+    is_day = bool(cur.get("is_day", 1))
+    text, icon = describe_wmo(cur.get("weather_code"), is_day)
+    out = {
+        "location": loc["name"],
+        "unit": "F" if imperial else "C",
+        "wind_unit": "mph" if imperial else "km/h",
+        "current": {
+            "temp": whole(cur.get("temperature_2m")),
+            "feels": whole(cur.get("apparent_temperature")),
+            "humidity": whole(cur.get("relative_humidity_2m")),
+            "wind": whole(cur.get("wind_speed_10m")),
+            "code": cur.get("weather_code"),
+            "icon": icon,
+            "text": text,
+            "is_day": is_day,
+        },
+        "daily": [],
+        "timezone": raw.get("timezone"),
+        "utc_offset": raw.get("utc_offset_seconds"),
+    }
+
+    daily = raw.get("daily") or {}
+    dates = daily.get("time") or []
+    codes = daily.get("weather_code") or []
+    highs = daily.get("temperature_2m_max") or []
+    lows = daily.get("temperature_2m_min") or []
+    pops = daily.get("precipitation_probability_max") or []
+
+    def at(seq, i):
+        return seq[i] if i < len(seq) else None
+
+    for i, date in enumerate(dates[:5]):
+        text, icon = describe_wmo(at(codes, i), True)
+        try:
+            day = datetime.strptime(date, "%Y-%m-%d").strftime("%a")
+        except (ValueError, TypeError):
+            day = str(date)[-5:]
+        out["daily"].append(
+            {
+                "day": day,
+                "date": date,
+                "code": at(codes, i),
+                "icon": icon,
+                "text": text,
+                "hi": whole(at(highs, i)),
+                "lo": whole(at(lows, i)),
+                "precip": whole(at(pops, i)) or 0,
+            }
+        )
+    return out
+
+
+_weather_cache = {"at": 0.0, "fetched_at": 0.0, "data": None, "error": None}
+
+
+def weather_payload():
+    loc = weather_location()
+    if loc is None:
+        return {
+            "ok": False,
+            "configured": False,
+            "error": "no location - add bridge/weather_config.json or set one in Home Assistant",
+            "time": local_clock(None),
+        }
+
+    if time.time() - _weather_cache["at"] >= WEATHER_CACHE_SECONDS:
+        try:
+            data = fetch_open_meteo(loc)
+            _weather_cache.update(at=time.time(), fetched_at=time.time(), data=data, error=None)
+            log("[weather] %s: %s %s%s, %d-day forecast" % (
+                loc["name"], data["current"]["text"], data["current"]["temp"],
+                data["unit"], len(data["daily"])))
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as exc:
+            # Keep serving the last good forecast; try again sooner than the full cache life.
+            _weather_cache.update(
+                at=time.time() - WEATHER_CACHE_SECONDS + WEATHER_RETRY_SECONDS,
+                error="weather fetch failed: %s" % exc,
+            )
+            log("[weather] %s" % _weather_cache["error"])
+
+    clock = local_clock(loc.get("timezone"))
+    data = _weather_cache["data"]
+    if data is None:
+        return {
+            "ok": False,
+            "configured": True,
+            "error": _weather_cache["error"] or "no data yet",
+            "time": clock,
+        }
+
+    out = dict(data)
+    out.update(
+        ok=True,
+        configured=True,
+        time=clock,
+        fetched_at=int(_weather_cache["fetched_at"]),
+        stale=bool(_weather_cache["error"]),
+        error=_weather_cache["error"],
+        source="open-meteo, location from " + loc["source"],
+    )
+    return out
+
+
+# --------------------------------------------------------------------------------------
 # Cache + HTTP
 # --------------------------------------------------------------------------------------
 
@@ -889,6 +1158,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(dump())
         elif path == "/ha/state":
             self._send(ha_state())
+        elif path == "/weather":
+            self._send(weather_payload())
         else:
             self._send({"ok": False, "error": "not found"}, status=404)
 
@@ -942,10 +1213,14 @@ def main():
         action="store_true",
         help="list Home Assistant climate/light entities for ha_config.json",
     )
+    parser.add_argument("--weather", action="store_true", help="print the /weather payload and exit")
     args = parser.parse_args()
 
     if args.ha_discover:
         ha_discover()
+        return
+    if args.weather:
+        print(json.dumps(weather_payload(), indent=2))
         return
     if args.calibrate:
         calibrate(args.calibrate)
@@ -961,6 +1236,11 @@ def main():
     log("Claude usage bridge listening on %s:%d" % (args.host, args.port))
     for ip in local_ips():
         log("  device should poll:  http://%s:%d/usage" % (ip, args.port))
+    loc = weather_location()
+    if loc:
+        log("  weather for %s (%.3f, %.3f) from %s" % (loc["name"], loc["latitude"], loc["longitude"], loc["source"]))
+    else:
+        log("  weather: no location - add weather_config.json or configure Home Assistant")
     log("  reading transcripts from: %s" % PROJECTS_DIR)
     log("  weekly reset: weekday %d at %02d:00 local; per-model gauge: %s" % (WEEKLY_RESET_WEEKDAY, WEEKLY_RESET_HOUR, MODEL_LABEL))
     try:
