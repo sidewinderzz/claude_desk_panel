@@ -34,7 +34,7 @@
 using namespace esp_panel::board;
 using namespace esp_panel::drivers;
 
-#define FIRMWARE_VERSION "0.5"
+#define FIRMWARE_VERSION "0.6"
 
 static Board *board = nullptr;
 static Preferences prefs;
@@ -97,10 +97,26 @@ static bool boardInit()
 
 static void backlight(bool on)
 {
-    if (board && board->getBacklight()) {
-        if (on) board->getBacklight()->on();
-        else    board->getBacklight()->off();
-    }
+    if (!board || !board->getBacklight()) return;
+
+    /* Not just a GPIO toggle. On this board the backlight is a CH422G expander
+     * pin, so this is an I2C write to 0x20 on bus 0 (SCL 9 / SDA 8) - the same
+     * bus the GT911 touch controller sits on at 0x5D. The LVGL task reads the
+     * touch from inside lv_timer_handler(), which it runs under this same lock.
+     *
+     * Without the lock the two transactions can interleave, and the CH422G has
+     * one 8-bit output register holding BOTH the backlight and LCD_RST: a
+     * mangled read-modify-write lands a byte with LCD_RST low and the ST7262
+     * sits in reset. That is a white screen with the MCU still running happily,
+     * which reads like a hang or a boot loop but is neither.
+     *
+     * Wake-on-tap is exactly when the two collide: the tap that triggers this
+     * call is the same tap the LVGL task is reading over I2C. The mutex is
+     * recursive, so taking it here is safe from anywhere. */
+    lvgl_port_lock(-1);
+    if (on) board->getBacklight()->on();
+    else    board->getBacklight()->off();
+    lvgl_port_unlock();
 }
 
 /* ------------------------------------------------------------ settings --- */
