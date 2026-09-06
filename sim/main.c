@@ -182,7 +182,8 @@ static void fill_ha(ui_ha_t *h, sim_state_t state)
         return;
     }
 
-    h->valid      = true;
+    h->valid          = true;
+    h->has_thermostat = true;
     h->current    = 21.5f;
     h->target     = 22.0f;
     h->has_target = true;

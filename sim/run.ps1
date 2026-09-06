@@ -61,7 +61,7 @@ if ($wslLibs -match '^([A-Za-z]):(.*)$') { $wslLibs = '/mnt/' + $Matches[1].ToLo
 $steps = @()
 if ($Clean) { $steps += 'make clean' }
 $steps += "make -j$Jobs ARDUINO_LIBS='$wslLibs'"
-if ($SimArgs) { $steps += "./sim $SimArgs" } else { $steps += 'make shots' }
+if ($SimArgs) { $steps += "./sim $SimArgs" } else { $steps += "make shots ARDUINO_LIBS='$wslLibs'" }
 
 $script = "set -e; cd '$wslDir'; " + ($steps -join '; ')
 

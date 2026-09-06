@@ -4,24 +4,12 @@ A desk display for a **Waveshare ESP32-S3-Touch-LCD-4.3B** (800×480 RGB, GT911 
 how much of your Claude usage window you've burned through, plus Home Assistant
 controls. Three pages, swipe between them.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ ✳ Claude Usage                          connected  ●     │
-├──────────────────────────────────────────────────────────┤
-│         5-HOUR SESSION        ┌──────────────────────┐   │
-│            ╭─────────╮        │ WEEKLY  ALL MODELS   │   │
-│          ╭─┤   62%   ├─╮      │ 41%                  │   │
-│          │ ╰─────────╯ │      │ ▓▓▓▓▓▓▓░░░░░░░░░░░░  │   │
-│          ╰─           ─╯      │ resets in 3d 0h      │   │
-│         resets in 1h 22m      └──────────────────────┘   │
-│                               ┌──────────────────────┐   │
-│                               │ WEEKLY  FABLE        │   │
-│                               │ 79%  ▓▓▓▓▓▓▓▓▓▓▓▓░░  │   │
-│                               └──────────────────────┘   │
-│                    ●  ○  ○                               │
-└──────────────────────────────────────────────────────────┘
-   Claude Usage           Office              Settings
-```
+![Claude Usage page](docs/screenshots/usage-dark.png)
+
+| Office | Settings |
+| --- | --- |
+| ![Office page](docs/screenshots/home-dark.png) | ![Settings page](docs/screenshots/settings-dark.png) |
+
 
 | | |
 | --- | --- |
@@ -54,6 +42,16 @@ light theme, limit reached, bridge offline, Wi-Fi setup — can be rendered with
 putting the device into it. Several real bugs were caught this way: sliders whose
 knobs were clipped by the parent, tracks that stayed LVGL-blue in both themes, and
 two `snprintf` truncations.
+
+Every screenshot in this README came out of it:
+
+| Light theme | Wi-Fi setup, on the device |
+| --- | --- |
+| ![Usage page, light theme](docs/screenshots/usage-light.png) | ![Wi-Fi setup](docs/screenshots/wifi.png) |
+| ![Office page, light theme](docs/screenshots/home-light.png) | ![Limit reached](docs/screenshots/limit.png) |
+
+The rest are in [`docs/screenshots/`](docs/screenshots) - stale data, bridge offline,
+no Wi-Fi, dimmed.
 
 Needs gcc. On Windows, WSL works: `sudo apt install build-essential`.
 
