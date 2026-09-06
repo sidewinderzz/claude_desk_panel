@@ -124,20 +124,34 @@ fix the numerator:
 python bridge/claude_usage_bridge.py --calibrate "session=1,week=20,model=30"
 ```
 
-**Read the provenance.** Each gauge reports its own — `api`, `api-scaled`,
-`calibrated`, `rejection` or `fallback` — and the panel appends `est.` under any
-gauge that isn't live. Be aware how quiet that signal is: the big percentage
-looks identical either way, and `est.` is small muted text under it.
+**The panel will not show a number it cannot stand behind.** Each gauge reports
+its source — `api`, `api-scaled`, `calibrated`, `rejection` or `fallback` — and
+only a live one is drawn as a percentage:
+
+| source | shown as |
+| --- | --- |
+| `api` | the number, normally |
+| `api-scaled` | `~79%`, with `share est.` beneath it |
+| anything else | `--`, empty arc and bars in the muted colour |
+
+An earlier version printed every estimate in the same type as a real reading
+with a small `est.` beneath it. That is why a 45% session read as 9.6% on this
+desk for weeks: from across a room you see the number, not the qualifier.
+
+Reset countdowns still show without a token — the window arithmetic is local
+clock maths and stays true either way.
 
 Two things worth knowing:
 
 - **The per-model gauge is never fully live.** There is no per-model header, so
   `api-scaled` takes the local logs' estimate of that model's *share* of the week
   and rescales it to the real weekly total. The total is real; the share inherits
-  the one-machine blindness above.
-- **Token expiry degrades silently.** On a 401 the bridge logs
-  `token rejected — run claude setup-token` and the gauges drop back to
-  `fallback`. The panel keeps showing confident-looking numbers.
+  the one-machine blindness above. Hence the permanent `~`.
+- **Token expiry degrades visibly.** On a 401 the bridge logs
+  `token rejected — run claude setup-token`, the gauges fall back, and the panel
+  blanks them and says `no live usage - set up bridge/token.txt`.
+
+![No token](docs/screenshots/notoken.png)
 
 ---
 
