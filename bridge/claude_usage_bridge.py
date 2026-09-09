@@ -402,27 +402,38 @@ API_URL = "https://api.anthropic.com/v1/messages"
 API_POLL_SECONDS = 60
 
 
+CRED_FILES = [
+    os.path.join(CLAUDE_DIR, ".credentials.json"),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Claude", ".credentials.json"),
+    os.path.join(os.environ.get("APPDATA", ""), "Claude", ".credentials.json"),
+]
+
+
 def read_oauth_token():
-    """Locate the Claude OAuth access token, or return None.
+    """Locate the Claude OAuth access token as (token, source), or (None, None).
 
     Order: CLAUDE_CODE_OAUTH_TOKEN env var (what `claude setup-token` is for),
     bridge/token.txt, then Claude Code's own ~/.claude/.credentials.json.
+
+    The source matters operationally, not just for debugging - see credential_status().
+    The first two are tokens you minted deliberately and that nothing else rotates. The
+    third is Claude Code's own working credential: it is refreshed roughly hourly and
+    expires outright about a week after Claude Code was last run, so a panel resting on
+    it goes dark during any quiet week. Callers re-read this per fetch; never cache it.
     """
     token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if token:
-        return token
+        return token, "env"
     try:
         with open(TOKEN_FILE, "r", encoding="utf-8") as handle:
             token = handle.read().strip()
         if token:
-            return token
+            return token, "token.txt"
     except OSError:
         pass
-    for path in (
-        os.path.join(CLAUDE_DIR, ".credentials.json"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Claude", ".credentials.json"),
-        os.path.join(os.environ.get("APPDATA", ""), "Claude", ".credentials.json"),
-    ):
+    for path in CRED_FILES:
+        if not path:
+            continue
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
@@ -430,8 +441,79 @@ def read_oauth_token():
             continue
         oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
         if isinstance(oauth, dict) and oauth.get("accessToken"):
-            return oauth["accessToken"]
+            return oauth["accessToken"], "credentials.json"
+    return None, None
+
+
+def _cred_file_expiry():
+    """Seconds until Claude Code's own credential expires outright, or None.
+
+    Reads refreshTokenExpiresAt from .credentials.json. The access token beside it
+    rotates hourly and is not worth warning about; the refresh token is the real cliff.
+    """
+    for path in CRED_FILES:
+        if not path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                oauth = (json.load(handle) or {}).get("claudeAiOauth") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        ms = oauth.get("refreshTokenExpiresAt")
+        if isinstance(ms, (int, float)):
+            return int(ms / 1000 - time.time())
     return None
+
+
+# Warn once a credential is inside this window of expiring.
+CRED_WARN_SECONDS = 2 * 24 * 3600
+
+
+def credential_status():
+    """Where the token came from, and whether it is about to strand the panel.
+
+    Returned in /dump and logged at startup so the answer to "why did the gauges go
+    blank" is available before they do, not only afterwards.
+    """
+    token, source = read_oauth_token()
+    if not token:
+        return {
+            "source": None,
+            "ok": False,
+            "expires_in_days": None,
+            "detail": "no token - run `claude setup-token` and save it to bridge/token.txt",
+        }
+    if source != "credentials.json":
+        return {
+            "source": source,
+            "ok": True,
+            "expires_in_days": None,
+            "detail": "token you minted; nothing else rotates it",
+        }
+    left = _cred_file_expiry()
+    if left is None:
+        detail = "borrowing Claude Code's credential (expiry unknown)"
+        return {"source": source, "ok": True, "expires_in_days": None, "detail": detail}
+    days = round(left / 86400.0, 1)
+    if left <= 0:
+        return {
+            "source": source,
+            "ok": False,
+            "expires_in_days": days,
+            "detail": "Claude Code's credential has expired - run `claude setup-token` "
+                      "and save it to bridge/token.txt",
+        }
+    detail = (
+        "borrowing Claude Code's credential, expires in %.1f days; it renews only while "
+        "you keep using Claude Code. Run `claude setup-token` into bridge/token.txt to "
+        "stop depending on that." % days
+    )
+    return {
+        "source": source,
+        "ok": left > CRED_WARN_SECONDS,
+        "expires_in_days": days,
+        "detail": detail,
+    }
 
 
 _api_cache = {"at": 0.0, "data": None, "error": None}
@@ -448,7 +530,7 @@ def fetch_api_usage(now):
     if time.time() - _api_cache["at"] < API_POLL_SECONDS:
         return _api_cache["data"]
 
-    token = read_oauth_token()
+    token, token_source = read_oauth_token()
     if not token:
         _api_cache.update(at=time.time(), data=None, error="no token")
         return None
@@ -480,7 +562,16 @@ def fetch_api_usage(now):
         # Rate-limit headers are present on a 429 too, which is exactly when they matter.
         headers = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
         if exc.code in (401, 403):
-            _api_cache.update(at=time.time(), data=None, error="token rejected (%d) - run `claude setup-token`" % exc.code)
+            hint = (
+                " - Claude Code's credential lapsed; run `claude setup-token` and save it "
+                "to bridge/token.txt so the panel stops depending on it"
+                if token_source == "credentials.json"
+                else " - run `claude setup-token`"
+            )
+            _api_cache.update(
+                at=time.time(), data=None,
+                error="token rejected (%d, from %s)%s" % (exc.code, token_source, hint),
+            )
             log("[api] " + _api_cache["error"])
             return None
         if exc.code != 429:
@@ -641,6 +732,7 @@ def dump():
     tz = local_tz()
     return {
         "claude_dir": CLAUDE_DIR,
+        "credential": credential_status(),
         "calibration_file": CALIBRATION_FILE,
         "calibration": calibration,
         "usage_events": len(events),
@@ -1241,6 +1333,10 @@ def main():
         log("  weather for %s (%.3f, %.3f) from %s" % (loc["name"], loc["latitude"], loc["longitude"], loc["source"]))
     else:
         log("  weather: no location - add weather_config.json or configure Home Assistant")
+    cred = credential_status()
+    log("  credential: %s" % cred["detail"])
+    if not cred["ok"]:
+        log("  WARNING: the usage gauges will blank when this lapses")
     log("  reading transcripts from: %s" % PROJECTS_DIR)
     log("  weekly reset: weekday %d at %02d:00 local; per-model gauge: %s" % (WEEKLY_RESET_WEEKDAY, WEEKLY_RESET_HOUR, MODEL_LABEL))
     try:
