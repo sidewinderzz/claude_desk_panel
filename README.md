@@ -249,6 +249,18 @@ boot. Download mode: hold BOOT, tap RESET, release BOOT.
 - **RGB timings are stack-specific and don't transfer.** The bounce-buffer size that
   is right under ESP32_Display_Panel produces a blank white screen under Arduino_GFX,
   which wants `width*10`.
+- **Wi-Fi recovery (v0.9).** Power save is off (`WiFi.setSleep(false)`; the panel is on
+  USB power, and modem sleep is a common cause of a link that drops after a while). A
+  lost link gets a retry every 15 s, a full radio restart after 2 minutes, and a reboot
+  after 10 minutes offline. If the link says connected but the bridge has been silent
+  for 5 minutes, the radio is restarted once (then at most every 15 minutes). Backing
+  out of Wi-Fi setup without connecting now reconnects to the saved network.
+- **Serial log (v0.9).** Boot prints the reset reason (a crash, watchdog or brownout
+  says so) and the bridge URL. Every minute an `[diag] alive` line gives heap, Wi-Fi
+  status, RSSI, screen on/off and how long since the bridge last answered, so a monitor
+  opened at any time shows within a minute what state the panel is in. If board
+  bring-up fails, the reason is repeated for a minute and the panel retries twice
+  before halting.
 - **Serial diagnostics** on the USB port: `i` health (heap, Wi-Fi, clock, weather),
   `s`/`w` sleep and wake exactly as the idle timer does, `r` DMA restart, `b`/`B`
   backlight only, `W` fetch weather, `R` reboot, `?` list. A whole reboot-and-wake

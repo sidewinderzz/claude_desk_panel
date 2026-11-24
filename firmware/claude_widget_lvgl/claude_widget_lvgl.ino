@@ -25,6 +25,7 @@
 #include <ArduinoJson.h>
 #include <sys/time.h>
 #include <time.h>
+#include <esp_system.h>
 
 #include <esp_display_panel.hpp>
 #include <esp_lcd_panel_rgb.h>
@@ -37,7 +38,7 @@
 using namespace esp_panel::board;
 using namespace esp_panel::drivers;
 
-#define FIRMWARE_VERSION "0.8"
+#define FIRMWARE_VERSION "0.9"
 
 /* Older config.h files predate the clock page. */
 #ifndef WEATHER_POLL_MS
@@ -77,6 +78,11 @@ static unsigned long screenOffAt = 0;
 static bool haveUsage = false;
 static bool haveWeather = false;
 static bool timeSynced = false;
+
+/* Bridge health, for the serial heartbeat and the stuck-link check in netLoop(). */
+static unsigned long lastUsageOkAt = 0;   /* millis() of the last good /usage reply */
+static unsigned long usageFailSince = 0;  /* first failure in the current run, 0 if none */
+static unsigned int usageFailCount = 0;   /* consecutive failed /usage fetches */
 
 /* --------------------------------------------------------------- board --- */
 
@@ -163,11 +169,15 @@ static void backlight(bool on)
 
 static void logHealth(const char *why)
 {
-    Serial.printf("[diag] %s up=%lus heap=%u/%u psram=%u wifi=%d rssi=%d\n",
+    Serial.printf("[diag] %s up=%lus heap=%u/%u minheap=%u psram=%u wifi=%d rssi=%d screen=%s\n",
                   why, millis() / 1000UL,
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
-                  (unsigned)ESP.getFreePsram(),
-                  (int)WiFi.status(), (int)WiFi.RSSI());
+                  (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getFreePsram(),
+                  (int)WiFi.status(), (int)WiFi.RSSI(), screenOff ? "off" : "on");
+    Serial.printf("[diag] bridge %s last-ok=%s%lus ago fails=%u\n",
+                  BRIDGE_URL, lastUsageOkAt ? "" : "never/",
+                  lastUsageOkAt ? (millis() - lastUsageOkAt) / 1000UL : millis() / 1000UL,
+                  usageFailCount);
     time_t t = time(nullptr);
     struct tm tmv;
     gmtime_r(&t, &tmv);
@@ -375,11 +385,19 @@ static bool fetchUsage()
         usage.valid = true;
         haveUsage = true;
         fetchedAt = millis();
+        lastUsageOkAt = fetchedAt;
+        if (usageFailCount)
+            Serial.printf("[usage] bridge back after %u failed fetches\n", usageFailCount);
+        usageFailCount = 0;
+        usageFailSince = 0;
         Serial.printf("[usage] session %.1f%%  week %.1f%%  %s %.1f%%  (%s)\n",
                       usage.session.pct, usage.week.pct, usage.model_label,
                       usage.model.pct, usage.session.source);
     } else {
         usage.valid = haveUsage; /* keep the last good numbers on a transient failure */
+        usageFailCount++;
+        if (!usageFailSince) usageFailSince = millis();
+        Serial.printf("[usage] fetch failed (%u in a row) from %s\n", usageFailCount, BRIDGE_URL);
     }
     lvgl_port_lock(-1);
     ui_set_usage(&usage);
@@ -515,15 +533,64 @@ static void haCall(const char *json)
 enum NetStatus { NET_OFFLINE = 0, NET_CONNECTING, NET_ONLINE };
 static NetStatus netState = NET_OFFLINE;
 static unsigned long netAttemptStart = 0, netLastReconnect = 0;
+static unsigned long netDownSince = 0;      /* when the link was last lost, 0 while up */
+static unsigned long netLastRadioReset = 0; /* last full radio restart, any cause */
 static bool netFailureShown = false;
 static volatile int lastDisconnectReason = 0;
+
+/* Recovery ladder for a link that will not come back on its own. Each rung is
+ * only reached if the one before it has had time to work:
+ *   every 15 s   WiFi.reconnect()             - the cheap retry
+ *   after 2 min  radio off, then WiFi.begin() - clears a wedged driver state
+ *   after 10 min ESP.restart()                - last resort, ~3 s, settings kept
+ * Before this the firmware only ever did the first rung, so a driver that got
+ * itself stuck stayed stuck until someone pulled the plug. */
 static const unsigned long RECONNECT_INTERVAL_MS = 15000;
+static const unsigned long RADIO_RESET_AFTER_MS = 2UL * 60UL * 1000UL;
+static const unsigned long REBOOT_AFTER_MS = 10UL * 60UL * 1000UL;
+
+/* A link can also report WL_CONNECTED while passing no traffic (a half-dead
+ * association after a router channel change or DHCP hiccup). If the bridge has
+ * not answered for this long while "connected", restart the radio once; repeat
+ * at most every BRIDGE_STUCK_RETRY_MS so a PC that is simply off costs little. */
+static const unsigned long BRIDGE_STUCK_MS = 5UL * 60UL * 1000UL;
+static const unsigned long BRIDGE_STUCK_RETRY_MS = 15UL * 60UL * 1000UL;
+
+static const char *wifiReasonName(int r)
+{
+    switch (r) {
+        case 0:   return "none";
+        case 2:   return "AUTH_EXPIRE";
+        case 3:   return "AUTH_LEAVE";
+        case 4:   return "ASSOC_EXPIRE";
+        case 8:   return "ASSOC_LEAVE";
+        case 15:  return "4WAY_HANDSHAKE_TIMEOUT";
+        case 200: return "BEACON_TIMEOUT";
+        case 201: return "NO_AP_FOUND";
+        case 202: return "AUTH_FAIL";
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";
+        case 205: return "CONNECTION_FAIL";
+        default:  return "other";
+    }
+}
 
 static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
 {
-    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         lastDisconnectReason = info.wifi_sta_disconnected.reason;
-        Serial.printf("[wifi] disconnected, reason %d\n", lastDisconnectReason);
+        Serial.printf("[wifi] disconnected, reason %d (%s)\n", lastDisconnectReason,
+                      wifiReasonName(lastDisconnectReason));
+        break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+        Serial.println("[wifi] got IP");
+        break;
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+        Serial.println("[wifi] lost IP");
+        break;
+    default:
+        break;
     }
 }
 
@@ -542,31 +609,80 @@ static void netBegin()
     lastDisconnectReason = 0;
     netFailureShown = false;
     netAttemptStart = netLastReconnect = millis();
+    if (!netDownSince) netDownSince = netAttemptStart;
     netState = NET_CONNECTING;
+    /* Credentials live in our own NVS namespace; stop the core writing a second
+     * copy to flash on every begin(). */
+    WiFi.persistent(false);
+    WiFi.setHostname("claude-desk-panel");
     WiFi.mode(WIFI_STA);
+    /* Modem power save is on by default in station mode. The panel is on USB
+     * power, and with some routers power save is what turns into a link that
+     * quietly drops after a while (missed beacons -> BEACON_TIMEOUT). Off. */
+    WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
     WiFi.begin(wifiSsid, wifiPass);
     Serial.printf("[net] connecting to %s\n", wifiSsid);
 }
 
-static void netLoop()
+/* Full radio restart: what a power cycle would do to the Wi-Fi side, without
+ * losing the screen or the clock. */
+static void netRadioReset(const char *why)
+{
+    Serial.printf("[net] restarting radio (%s)\n", why);
+    netLastRadioReset = millis();
+    WiFi.disconnect(true);   /* drop the association and turn the radio off */
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+    netBegin();
+}
+
+static void netLoop(bool onSetup)
 {
     unsigned long now = millis();
+
+    /* Back out of the Wi-Fi setup screen without connecting: doScan() left the
+     * radio off, and nothing turned it back on until a reboot. */
+    if (netState == NET_OFFLINE && !onSetup && strlen(wifiSsid)) {
+        Serial.println("[net] radio was off outside setup, reconnecting");
+        netBegin();
+        return;
+    }
+
     if (WiFi.status() != WL_CONNECTED) {
-        if (netState == NET_ONLINE) Serial.println("[net] lost connection");
         if (netState == NET_OFFLINE) return;
+        if (netState == NET_ONLINE) {
+            Serial.printf("[net] lost connection (reason %d %s)\n", (int)lastDisconnectReason,
+                          wifiReasonName(lastDisconnectReason));
+            netDownSince = now;
+        }
         netState = NET_CONNECTING;
 
         if (!netFailureShown && now - netAttemptStart > WIFI_CONNECT_MS) {
             netFailureShown = true;
-            Serial.printf("[net] no association after %lus (reason %d)\n",
-                          WIFI_CONNECT_MS / 1000UL, (int)lastDisconnectReason);
+            Serial.printf("[net] no association after %lus (reason %d %s)\n",
+                          WIFI_CONNECT_MS / 1000UL, (int)lastDisconnectReason,
+                          wifiReasonName(lastDisconnectReason));
             lvgl_port_lock(-1);
             if (ui_wifi_is_active()) ui_wifi_set_message(describeWiFiFailure(), true);
             lvgl_port_unlock();
         }
+
+        unsigned long down = netDownSince ? now - netDownSince : 0;
+        if (!onSetup && down > REBOOT_AFTER_MS) {
+            Serial.printf("[net] offline for %lus, rebooting\n", down / 1000UL);
+            Serial.flush();
+            delay(100);
+            ESP.restart();
+        }
+        if (!onSetup && down > RADIO_RESET_AFTER_MS &&
+            now - netLastRadioReset > RADIO_RESET_AFTER_MS) {
+            netRadioReset("offline 2 min");
+            return;
+        }
         if (now - netLastReconnect > RECONNECT_INTERVAL_MS) {
             netLastReconnect = now;
+            Serial.printf("[net] still offline after %lus, retrying\n", down / 1000UL);
             WiFi.reconnect();
         }
         return;
@@ -574,8 +690,12 @@ static void netLoop()
 
     if (netState != NET_ONLINE) {
         netState = NET_ONLINE;
-        Serial.printf("[net] online, ip=%s rssi=%d\n",
-                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        Serial.printf("[net] online, ip=%s gw=%s rssi=%d ch=%d (down %lus)\n",
+                      WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
+                      WiFi.RSSI(), WiFi.channel(),
+                      netDownSince ? (now - netDownSince) / 1000UL : 0UL);
+        netDownSince = 0;
+        usageFailSince = 0;   /* time the bridge only while we are actually online */
         if (netPendingSave) { netPendingSave = false; saveCredentials(); }
         fetchUsage();
         reqHaRefresh = true;
@@ -584,6 +704,16 @@ static void netLoop()
         ui_show_page(UI_PAGE_USAGE);
         lvgl_port_unlock();
         lastPoll = millis();
+        return;
+    }
+
+    /* Associated, but is anything getting through? */
+    if (!onSetup && usageFailSince && now - usageFailSince > BRIDGE_STUCK_MS &&
+        now - netLastRadioReset > BRIDGE_STUCK_RETRY_MS) {
+        Serial.printf("[net] connected but bridge silent for %lus - is %s running? "
+                      "restarting radio in case the link is stuck\n",
+                      (now - usageFailSince) / 1000UL, BRIDGE_URL);
+        netRadioReset("bridge silent");
     }
 }
 
@@ -594,6 +724,7 @@ static void doScan()
         netState = NET_OFFLINE;
         delay(200);
     }
+    netDownSince = 0;   /* the setup screen restarts the offline clock */
     WiFi.mode(WIFI_STA);
     int n = WiFi.scanNetworks();
     Serial.printf("[wifi] scan found %d networks\n", n);
@@ -620,16 +751,62 @@ static void doScan()
 
 /* ------------------------------------------------------------------ app --- */
 
+static const char *resetReasonName(esp_reset_reason_t r)
+{
+    switch (r) {
+        case ESP_RST_POWERON:  return "power on";
+        case ESP_RST_EXT:      return "reset pin";
+        case ESP_RST_SW:       return "software restart";
+        case ESP_RST_PANIC:    return "CRASH (panic)";
+        case ESP_RST_INT_WDT:  return "CRASH (interrupt watchdog)";
+        case ESP_RST_TASK_WDT: return "CRASH (task watchdog)";
+        case ESP_RST_WDT:      return "CRASH (other watchdog)";
+        case ESP_RST_BROWNOUT: return "BROWNOUT - power supply sagged";
+        case ESP_RST_DEEPSLEEP:return "deep sleep wake";
+        case ESP_RST_USB:      return "USB reset";
+        default:               return "unknown";
+    }
+}
+
+/* Survives a software restart, not a power cycle. Counts boots in a row whose
+ * board bring-up failed, so a transient I2C/expander glitch gets a few clean
+ * retries but a real hardware fault does not reboot forever. */
+static RTC_NOINIT_ATTR uint32_t bootFailMagic;
+static RTC_NOINIT_ATTR uint32_t bootFailCount;
+static const uint32_t BOOT_FAIL_MAGIC = 0xC1A0DE01;
+
 void setup()
 {
     Serial.begin(115200);
     delay(300);
-    Serial.printf("\n[boot] Claude usage widget v%s\n", FIRMWARE_VERSION);
+    esp_reset_reason_t rr = esp_reset_reason();
+    Serial.printf("\n[boot] Claude usage widget v%s, reset reason: %s (%d)\n",
+                  FIRMWARE_VERSION, resetReasonName(rr), (int)rr);
+    Serial.printf("[boot] bridge %s\n", BRIDGE_URL);
+    if (bootFailMagic != BOOT_FAIL_MAGIC) { bootFailMagic = BOOT_FAIL_MAGIC; bootFailCount = 0; }
 
     if (!boardInit()) {
-        Serial.println("[boot] board init failed, halting");
-        while (true) delay(1000);
+        /* The screen is dark here and stays dark, so the only clue is serial -
+         * and with USB CDC the monitor is usually opened after this line has
+         * already gone by. Repeat it, then retry with a clean restart. */
+        bootFailCount++;
+        for (int i = 0; i < 12; i++) {
+            Serial.printf("[boot] board init FAILED (boot %u in a row) - screen will stay "
+                          "blank. Check the board setting: ESP32S3 Dev Module, OPI PSRAM, "
+                          "16MB flash.\n", (unsigned)bootFailCount);
+            delay(5000);
+        }
+        if (bootFailCount < 3) {
+            Serial.println("[boot] restarting to retry");
+            Serial.flush();
+            ESP.restart();
+        }
+        while (true) {
+            Serial.println("[boot] board init failed 3 boots in a row, halted. Power-cycle to retry.");
+            delay(10000);
+        }
     }
+    bootFailCount = 0;
 
     memset(&usage, 0, sizeof(usage));
     memset(&haState, 0, sizeof(haState));
@@ -685,13 +862,14 @@ void loop()
     }
 
     serialCommands();
-    netLoop();
 
-    bool online = WiFi.status() == WL_CONNECTED;
     bool onSetup;
     lvgl_port_lock(-1);
     onSetup = ui_wifi_is_active();
     lvgl_port_unlock();
+
+    netLoop(onSetup);
+    bool online = WiFi.status() == WL_CONNECTED;
 
     if (reqRefresh) {
         reqRefresh = false;
@@ -746,6 +924,14 @@ void loop()
             lastHaPoll = now;
             fetchHA();
         }
+    }
+
+    /* Heartbeat: one health line a minute, so a monitor opened at any time shows
+     * within 60 s whether the firmware is alive, on Wi-Fi and hearing the bridge. */
+    static unsigned long lastHeartbeat = 0;
+    if (now - lastHeartbeat >= 60000UL) {
+        lastHeartbeat = now;
+        logHealth("alive");
     }
 
     if (now - lastTick >= 1000) {
